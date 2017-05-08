@@ -5,7 +5,7 @@
 \title{Dump an xgboost model in text format.}
 \usage{
 xgb.dump(model, fname = NULL, fmap = "", with_stats = FALSE,
-  dump_format = c("text", "json"), ...)
+  dump_format = c("text", "json"), precision = NULL, ...)
 }
 \arguments{
 \item{model}{the model object.}
@@ -26,6 +26,8 @@ gain is the approximate loss function gain we get in each split;
 cover is the sum of second order gradient in each node.}
 
 \item{dump_format}{either 'text' or 'json' format could be specified.}
+
+\item{precision}{TODO}
 
 \item{...}{currently not used}
 }
@@ -49,7 +51,7 @@ xgb.dump(bst, 'xgb.model.dump', with_stats = TRUE)
 # print the model without saving it to a file
 print(xgb.dump(bst, with_stats = TRUE))
 
-# print in JSON format:
-cat(xgb.dump(bst, with_stats = TRUE, dump_format='json'))
+# print in JSON format using higher precision:
+cat(xgb.dump(bst, with_stats = TRUE, dump_format='json', precision = 17))
 
 }

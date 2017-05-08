@@ -16,6 +16,7 @@
 #'        gain is the approximate loss function gain we get in each split;
 #'        cover is the sum of second order gradient in each node.
 #' @param dump_format either 'text' or 'json' format could be specified.
+#' @param precision TODO
 #' @param ... currently not used
 #'
 #' @return
@@ -35,12 +36,12 @@
 #' # print the model without saving it to a file
 #' print(xgb.dump(bst, with_stats = TRUE))
 #' 
-#' # print in JSON format:
-#' cat(xgb.dump(bst, with_stats = TRUE, dump_format='json'))
+#' # print in JSON format using higher precision:
+#' cat(xgb.dump(bst, with_stats = TRUE, dump_format='json', precision = 17))
 #' 
 #' @export
 xgb.dump <- function(model, fname = NULL, fmap = "", with_stats=FALSE,
-                     dump_format = c("text", "json"), ...) {
+                     dump_format = c("text", "json"), precision = NULL, ...) {
   check.deprecation(...)
   dump_format <- match.arg(dump_format)
   if (!inherits(model, "xgb.Booster"))
@@ -49,10 +50,16 @@ xgb.dump <- function(model, fname = NULL, fmap = "", with_stats=FALSE,
     stop("fname: argument must be a character string (when provided)")
   if (!(is.null(fmap) || is.character(fmap)))
     stop("fmap: argument must be a character string (when provided)")
+  if (!is.null(precision) && (!is.numeric(precision) || precision < 0))
+    stop("precision: must be positive integer")
+
+  dump_cfg <- paste0('format=', dump_format)
+  if (!is.null(precision)) dump_cfg <- paste0(dump_cfg, ' precision=', precision)
+  if (with_stats) dump_cfg <- paste0(dump_cfg, ' with_stats=1')
   
   model <- xgb.Booster.complete(model)
-  model_dump <- .Call("XGBoosterDumpModel_R", model$handle, NVL(fmap, "")[1], as.integer(with_stats),
-                      as.character(dump_format), PACKAGE = "xgboost")
+  model_dump <- .Call("XGBoosterDumpModel_R", model$handle, NVL(fmap, "")[1],
+                      dump_cfg, PACKAGE = "xgboost")
 
   if (is.null(fname)) 
     model_dump <- stri_replace_all_regex(model_dump, '\t', '')

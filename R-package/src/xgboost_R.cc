@@ -357,7 +357,7 @@ SEXP XGBoosterModelToRaw_R(SEXP handle) {
   return ret;
 }
 
-SEXP XGBoosterDumpModel_R(SEXP handle, SEXP fmap, SEXP with_stats, SEXP dump_format) {
+SEXP XGBoosterDumpModel_R(SEXP handle, SEXP fmap, SEXP dump_format) {
   SEXP out;
   R_API_BEGIN();
   bst_ulong olen;
@@ -365,11 +365,9 @@ SEXP XGBoosterDumpModel_R(SEXP handle, SEXP fmap, SEXP with_stats, SEXP dump_for
   const char *fmt = CHAR(asChar(dump_format));
   CHECK_CALL(XGBoosterDumpModelEx(R_ExternalPtrAddr(handle),
                                 CHAR(asChar(fmap)),
-                                asInteger(with_stats),
-                                fmt,
-                                &olen, &res));
+                                0, fmt, &olen, &res));
   out = PROTECT(allocVector(STRSXP, olen));
-  if (!strcmp("json", fmt)) {
+  if (!strncmp("format=json", fmt, 11)) {
     std::stringstream stream;
     stream <<  "[\n";
     for (size_t i = 0; i < olen; ++i) {
