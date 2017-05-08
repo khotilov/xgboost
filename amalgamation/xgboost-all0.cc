@@ -52,6 +52,7 @@
 // global
 #include "../src/learner.cc"
 #include "../src/logging.cc"
+#include "../src/dump_model.cc"
 #include "../src/common/common.cc"
 #include "../src/common/hist_util.cc"
 

@@ -18,6 +18,7 @@
 #include "./data.h"
 #include "./logging.h"
 #include "./feature_map.h"
+#include "./dump_model.h"
 
 namespace xgboost {
 
@@ -482,13 +483,11 @@ class RegTree: public TreeModel<bst_float, RTreeNodeStat> {
   /*!
    * \brief dump the model in the requested format as a text string
    * \param fmap feature map that may help give interpretations of feature
-   * \param with_stats whether dump out statistics as well
-   * \param format the format to dump the model in
+   * \param dparam parameters for dump format and contents
    * \return the string of dumped model
    */
   std::string DumpModel(const FeatureMap& fmap,
-                        bool with_stats,
-                        std::string format) const;
+                        DumpModelParam& dparam) const;
 };
 
 // implementations of inline functions

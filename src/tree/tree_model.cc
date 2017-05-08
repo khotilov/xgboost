@@ -4,23 +4,24 @@
  * \brief model structure for tree
  */
 #include <xgboost/tree_model.h>
-#include <sstream>
 #include "./param.h"
 
 namespace xgboost {
+
 // register tree parameter
 DMLC_REGISTER_PARAMETER(TreeParam);
 
 namespace tree {
 DMLC_REGISTER_PARAMETER(TrainParam);
 }
+
 // internal function to dump regression tree to text
 void DumpRegTree(std::stringstream& fo,  // NOLINT(*)
                  const RegTree& tree,
                  const FeatureMap& fmap,
                  int nid, int depth, int add_comma,
-                 bool with_stats, std::string format) {
-  if (format == "json") {
+                 const DumpModelParam& param) {
+  if (param.format == kJSON) {
     if (add_comma) fo << ",";
     if (depth != 0) fo << std::endl;
     for (int i = 0; i < depth+1; ++i) fo << "  ";
@@ -28,16 +29,16 @@ void DumpRegTree(std::stringstream& fo,  // NOLINT(*)
     for (int i = 0; i < depth; ++i) fo << '\t';
   }
   if (tree[nid].is_leaf()) {
-    if (format == "json") {
+    if (param.format == kJSON) {
       fo << "{ \"nodeid\": " << nid
          << ", \"leaf\": " << tree[nid].leaf_value();
-      if (with_stats) {
+      if (param.with_stats) {
         fo << ", \"cover\": " << tree.stat(nid).sum_hess;
       }
       fo << " }";
     } else {
       fo << nid << ":leaf=" << tree[nid].leaf_value();
-      if (with_stats) {
+      if (param.with_stats) {
         fo << ",cover=" << tree.stat(nid).sum_hess;
       }
       fo << '\n';
@@ -51,7 +52,7 @@ void DumpRegTree(std::stringstream& fo,  // NOLINT(*)
         case FeatureMap::kIndicator: {
           int nyes = tree[nid].default_left() ?
               tree[nid].cright() : tree[nid].cleft();
-          if (format == "json") {
+          if (param.format == kJSON) {
             fo << "{ \"nodeid\": " << nid
                << ", \"depth\": " << depth
                << ", \"split\": \"" << fmap.name(split_index) << "\""
@@ -64,7 +65,7 @@ void DumpRegTree(std::stringstream& fo,  // NOLINT(*)
           break;
         }
         case FeatureMap::kInteger: {
-          if (format == "json") {
+          if (param.format == kJSON) {
             fo << "{ \"nodeid\": " << nid
                << ", \"depth\": " << depth
                << ", \"split\": \"" << fmap.name(split_index) << "\""
@@ -83,7 +84,7 @@ void DumpRegTree(std::stringstream& fo,  // NOLINT(*)
         }
         case FeatureMap::kFloat:
         case FeatureMap::kQuantitive: {
-          if (format == "json") {
+          if (param.format == kJSON) {
             fo << "{ \"nodeid\": " << nid
                << ", \"depth\": " << depth
                << ", \"split\": \"" << fmap.name(split_index) << "\""
@@ -102,7 +103,7 @@ void DumpRegTree(std::stringstream& fo,  // NOLINT(*)
         default: LOG(FATAL) << "unknown fmap type";
         }
     } else {
-      if (format == "json") {
+      if (param.format == kJSON) {
         fo << "{ \"nodeid\": " << nid
            << ", \"depth\": " << depth
            << ", \"split\": " << split_index
@@ -117,22 +118,22 @@ void DumpRegTree(std::stringstream& fo,  // NOLINT(*)
            << ",missing=" << tree[nid].cdefault();
       }
     }
-    if (with_stats) {
-      if (format == "json") {
+    if (param.with_stats) {
+      if (param.format == kJSON) {
         fo << ", \"gain\": " << tree.stat(nid).loss_chg
            << ", \"cover\": " << tree.stat(nid).sum_hess;
       } else {
         fo << ",gain=" << tree.stat(nid).loss_chg << ",cover=" << tree.stat(nid).sum_hess;
       }
     }
-    if (format == "json") {
+    if (param.format == kJSON) {
       fo << ", \"children\": [";
     } else {
       fo << '\n';
     }
-    DumpRegTree(fo, tree, fmap, tree[nid].cleft(), depth + 1, false, with_stats, format);
-    DumpRegTree(fo, tree, fmap, tree[nid].cright(), depth + 1, true, with_stats, format);
-    if (format == "json") {
+    DumpRegTree(fo, tree, fmap, tree[nid].cleft(), depth + 1, false, param);
+    DumpRegTree(fo, tree, fmap, tree[nid].cright(), depth + 1, true, param);
+    if (param.format == kJSON) {
       fo << std::endl;
       for (int i = 0; i < depth+1; ++i) fo << "  ";
       fo << "]}";
@@ -141,11 +142,11 @@ void DumpRegTree(std::stringstream& fo,  // NOLINT(*)
 }
 
 std::string RegTree::DumpModel(const FeatureMap& fmap,
-                               bool with_stats,
-                               std::string format) const {
+                               DumpModelParam& dparam) const {
   std::stringstream fo("");
+  dparam.setprecision(fo);
   for (int i = 0; i < param.num_roots; ++i) {
-    DumpRegTree(fo, *this, fmap, i, 0, false, with_stats, format);
+    DumpRegTree(fo, *this, fmap, i, 0, false, dparam);
   }
   return fo.str();
 }

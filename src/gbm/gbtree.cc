@@ -19,7 +19,6 @@
 #include <unordered_map>
 #include <algorithm>
 #include "../common/common.h"
-
 #include "../common/random.h"
 
 namespace xgboost {
@@ -325,9 +324,15 @@ class GBTree : public GradientBooster {
   std::vector<std::string> DumpModel(const FeatureMap& fmap,
                                      bool with_stats,
                                      std::string format) const override {
+    if (with_stats) {
+      format += " with_stats=1";
+    }
+    DumpModelParam dparam;
+    dparam.InitFromConfigString(format);
+
     std::vector<std::string> dump;
     for (size_t i = 0; i < trees.size(); i++) {
-      dump.push_back(trees[i]->DumpModel(fmap, with_stats, format));
+      dump.push_back(trees[i]->DumpModel(fmap, dparam));
     }
     return dump;
   }
