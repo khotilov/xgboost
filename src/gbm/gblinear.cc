@@ -9,6 +9,7 @@
 #include <dmlc/parameter.h>
 #include <xgboost/gbm.h>
 #include <xgboost/logging.h>
+#include <xgboost/dump_model.h>
 #include <vector>
 #include <string>
 #include <sstream>
@@ -228,7 +229,10 @@ class GBLinear : public GradientBooster {
                                      bool with_stats,
                                      std::string format) const override {
     std::stringstream fo("");
-    if (format == "json") {
+    DumpModelParam dparam;
+    dparam.InitFromConfigString(format);
+    dparam.setprecision(fo);
+    if (dparam.format == kJSON) {
       fo << "  { \"bias\": [" << std::endl;
       for (int i = 0; i < model.param.num_output_group; ++i) {
         if (i != 0) fo << "," << std::endl;

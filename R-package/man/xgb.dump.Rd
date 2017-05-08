@@ -54,4 +54,10 @@ print(xgb.dump(bst, with_stats = TRUE))
 # print in JSON format using higher precision:
 cat(xgb.dump(bst, with_stats = TRUE, dump_format='json', precision = 17))
 
+# dumping dblinear model
+bst <- xgboost(data = train$data, label = train$label, booster = "gblinear", alpha = 10,
+               eta = 0.4, nthread = 1, nrounds = 5, objective = "binary:logistic")
+xgb.dump(bst)
+cat(xgb.dump(bst, dump_format='json', precision = 17))
+
 }
