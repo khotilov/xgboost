@@ -11,7 +11,17 @@
 #'          It could be useful, e.g., in multiclass classification to get feature importances 
 #'          for each class separately. IMPORTANT: the tree index in xgboost models
 #'          is zero-based (e.g., use \code{trees = 0:4} for first 5 trees).
-#' @param data deprecated.
+#' @param shap_contrib individual case SHAP contributions obtained by running \code{\link{predict.xgb.Booster}}
+#'          with \code{predcontrib = TRUE}. This parameter takes precendence over \code{data}.
+#' @param data data matrix or DMatrix. When it is provided, but \code{shap_contrib} is not, individual case 
+#'          SHAP contributions are computed for that data (\url{https://arxiv.org/abs/1706.06060}),
+#'          and their absolute values are used to calculate SHAP feature importances.
+#' @param approxcontrib when set to TRUE, fast approximation for SHAP feature contributions are used
+#'          (see \code{\link{predict.xgb.Booster}}). If might be helpful, but not necessarily better,
+#'          with deep trees, since exact SHAP is significantly slower for deep trees.
+#' @param target_class is only relevant for multiclass models. When it is set to a 0-based class index,
+#'          only SHAP importances that are specific to that class are calculated.
+#'          If it is not set, SHAP importances are averaged over all classes.
 #' @param label deprecated.
 #' @param target deprecated.
 #'
@@ -35,7 +45,10 @@
 #'   \item \code{Cover} metric of the number of observation related to this feature;
 #'   \item \code{Frequency} percentage representing the relative number of times
 #'        a feature have been used in trees.
+#'   \item \code{SHAP} (only when \code{data=} was provided) fractional contribution of each
+#'        feature to the model based on its SHAP contributions.
 #' }
+#' When SHAP is present, the table is sorted in descending order by SHAP, else by Gain.
 #' 
 #' A linear model's importance \code{data.table} has the following columns:
 #' \itemize{
@@ -55,6 +68,8 @@
 #' bst <- xgboost(data = agaricus.train$data, label = agaricus.train$label, max_depth = 2, 
 #'                eta = 1, nthread = 2, nrounds = 2, objective = "binary:logistic")
 #' xgb.importance(model = bst)
+#' # compute SHAP-importances as well
+#' xgb.importance(model = bst, data = agaricus.train$data)
 #' 
 #' # binomial classification using gblinear:
 #' bst <- xgboost(data = agaricus.train$data, label = agaricus.train$label, booster = "gblinear", 
@@ -68,11 +83,12 @@
 #'                max_depth = 3, eta = 0.2, nthread = 2, nrounds = nrounds,
 #'                objective = "multi:softprob", num_class = nclass)
 #' # all classes clumped together:
-#' xgb.importance(model = mbst)
+#' xgb.importance(model = mbst, data = as.matrix(iris[, -5]))
 #' # inspect importances separately for each class:
-#' xgb.importance(model = mbst, trees = seq(from=0, by=nclass, length.out=nrounds))
-#' xgb.importance(model = mbst, trees = seq(from=1, by=nclass, length.out=nrounds))
-#' xgb.importance(model = mbst, trees = seq(from=2, by=nclass, length.out=nrounds))
+#' tree_seq0 <- seq(from=0, by=nclass, length.out=nrounds)
+#' xgb.importance(model = mbst, trees = tree_seq0, data = as.matrix(iris[, -5]), target_class = 0)
+#' xgb.importance(model = mbst, trees = tree_seq0 + 1, data = as.matrix(iris[, -5]), target_class = 1)
+#' xgb.importance(model = mbst, trees = tree_seq0 + 2, data = as.matrix(iris[, -5]), target_class = 2)
 #' 
 #' # multiclass classification using gblinear:
 #' mbst <- xgboost(data = scale(as.matrix(iris[, -5])), label = as.numeric(iris$Species) - 1,
@@ -82,10 +98,11 @@
 #'
 #' @export
 xgb.importance <- function(feature_names = NULL, model = NULL, trees = NULL,
-                           data = NULL, label = NULL, target = NULL){
+                           shap_contrib = NULL, data = NULL, approxcontrib = FALSE, target_class = NULL,
+                           label = NULL, target = NULL){
   
-  if (!(is.null(data) && is.null(label) && is.null(target)))
-    warning("xgb.importance: parameters 'data', 'label' and 'target' are deprecated")
+  if (!(is.null(label) && is.null(target)))
+    warning("xgb.importance: parameters 'label' and 'target' are deprecated")
   
   if (!inherits(model, "xgb.Booster"))
     stop("model: must be an object of class xgb.Booster")
@@ -129,6 +146,19 @@ xgb.importance <- function(feature_names = NULL, model = NULL, trees = NULL,
             Cover = Cover / sum(Cover),
             Frequency = Frequency / sum(Frequency))][
       order(Gain, decreasing = TRUE)]
+
+    if (!is.null(shap_contrib) || !is.null(data)) {
+      if (is.null(shap_contrib))
+        shap_contrib <- predict(model, data, predcontrib = TRUE, approxcontrib = approxcontrib)
+      if (is.list(shap_contrib)) { # multiclass
+        shap_contrib <- if (!is.null(target_class)) shap_contrib[[target_class + 1]]
+                        else Reduce("+", lapply(shap_contrib, abs))
+      }
+      SHAP <- colSums(abs(shap_contrib[, - NCOL(shap_contrib)]))
+      SHAP <- SHAP / sum(SHAP)
+      shap <- data.table(Feature = feature_names, SHAP = SHAP)
+      result <- merge(result, shap, by = "Feature")[order(SHAP, decreasing = TRUE)]
+    }
   }
   result
 }

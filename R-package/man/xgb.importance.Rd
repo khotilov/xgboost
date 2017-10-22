@@ -5,7 +5,8 @@
 \title{Importance of features in a model.}
 \usage{
 xgb.importance(feature_names = NULL, model = NULL, trees = NULL,
-  data = NULL, label = NULL, target = NULL)
+  shap_contrib = NULL, data = NULL, approxcontrib = FALSE,
+  target_class = NULL, label = NULL, target = NULL)
 }
 \arguments{
 \item{feature_names}{character vector of feature names. If the model already
@@ -20,7 +21,20 @@ It could be useful, e.g., in multiclass classification to get feature importance
 for each class separately. IMPORTANT: the tree index in xgboost models
 is zero-based (e.g., use \code{trees = 0:4} for first 5 trees).}
 
-\item{data}{deprecated.}
+\item{shap_contrib}{individual case SHAP contributions obtained by running \code{\link{predict.xgb.Booster}}
+with \code{predcontrib = TRUE}. This parameter takes precendence over \code{data}.}
+
+\item{data}{data matrix or DMatrix. When it is provided, but \code{shap_contrib} is not, individual case 
+SHAP contributions are computed for that data (\url{https://arxiv.org/abs/1706.06060}),
+and their absolute values are used to calculate SHAP feature importances.}
+
+\item{approxcontrib}{when set to TRUE, fast approximation for SHAP feature contributions are used
+(see \code{\link{predict.xgb.Booster}}). If might be helpful, but not necessarily better,
+with deep trees, since exact SHAP is significantly slower for deep trees.}
+
+\item{target_class}{is only relevant for multiclass models. When it is set to a 0-based class index,
+only SHAP importances that are specific to that class are calculated.
+If it is not set, SHAP importances are averaged over all classes.}
 
 \item{label}{deprecated.}
 
@@ -36,7 +50,10 @@ For a tree model, a \code{data.table} with the following columns:
   \item \code{Cover} metric of the number of observation related to this feature;
   \item \code{Frequency} percentage representing the relative number of times
        a feature have been used in trees.
+  \item \code{SHAP} (only when \code{data=} was provided) fractional contribution of each
+       feature to the model based on its SHAP contributions.
 }
+When SHAP is present, the table is sorted in descending order by SHAP, else by Gain.
 
 A linear model's importance \code{data.table} has the following columns:
 \itemize{
@@ -67,6 +84,8 @@ data(agaricus.train, package='xgboost')
 bst <- xgboost(data = agaricus.train$data, label = agaricus.train$label, max_depth = 2, 
                eta = 1, nthread = 2, nrounds = 2, objective = "binary:logistic")
 xgb.importance(model = bst)
+# compute SHAP-importances as well
+xgb.importance(model = bst, data = agaricus.train$data)
 
 # binomial classification using gblinear:
 bst <- xgboost(data = agaricus.train$data, label = agaricus.train$label, booster = "gblinear", 
@@ -80,11 +99,12 @@ mbst <- xgboost(data = as.matrix(iris[, -5]), label = as.numeric(iris$Species) -
                max_depth = 3, eta = 0.2, nthread = 2, nrounds = nrounds,
                objective = "multi:softprob", num_class = nclass)
 # all classes clumped together:
-xgb.importance(model = mbst)
+xgb.importance(model = mbst, data = as.matrix(iris[, -5]))
 # inspect importances separately for each class:
-xgb.importance(model = mbst, trees = seq(from=0, by=nclass, length.out=nrounds))
-xgb.importance(model = mbst, trees = seq(from=1, by=nclass, length.out=nrounds))
-xgb.importance(model = mbst, trees = seq(from=2, by=nclass, length.out=nrounds))
+tree_seq0 <- seq(from=0, by=nclass, length.out=nrounds)
+xgb.importance(model = mbst, trees = tree_seq0, data = as.matrix(iris[, -5]), target_class = 0)
+xgb.importance(model = mbst, trees = tree_seq0 + 1, data = as.matrix(iris[, -5]), target_class = 1)
+xgb.importance(model = mbst, trees = tree_seq0 + 2, data = as.matrix(iris[, -5]), target_class = 2)
 
 # multiclass classification using gblinear:
 mbst <- xgboost(data = scale(as.matrix(iris[, -5])), label = as.numeric(iris$Species) - 1,

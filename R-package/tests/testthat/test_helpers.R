@@ -227,28 +227,42 @@ test_that("xgb.model.dt.tree throws error for gblinear", {
 })
 
 test_that("xgb.importance works with and without feature names", {
-  importance.Tree <- xgb.importance(feature_names = feature.names, model = bst.Tree)
-  expect_equal(dim(importance.Tree), c(7, 4))
-  expect_equal(colnames(importance.Tree), c("Feature", "Gain", "Cover", "Frequency"))
-  expect_output(str(importance.Tree), 'Feature.*\\"Age\\"')
+  importance <- xgb.importance(feature_names = feature.names, model = bst.Tree)
+  expect_equal(dim(importance), c(7, 4))
+  expect_equal(colnames(importance), c("Feature", "Gain", "Cover", "Frequency"))
+  expect_output(str(importance), 'Feature.*\\"Age\\"')
 
-  importance.Tree.0 <- xgb.importance(model = bst.Tree)
-  expect_equal(importance.Tree, importance.Tree.0)
+  importance.0 <- xgb.importance(model = bst.Tree)
+  expect_equal(importance, importance.0)
+
+  # SHAP importances
+  importance.shap <- xgb.importance(model = bst.Tree, data = sparse_matrix)
+  expect_equal(dim(importance.shap), c(7, 5))
+  expect_equal(colnames(importance.shap), c("Feature", "Gain", "Cover", "Frequency", "SHAP"))
 
   # when model contains no feature names:
   bst.Tree.x <- bst.Tree
   bst.Tree.x$feature_names <- NULL
-  importance.Tree.x <- xgb.importance(model = bst.Tree)
-  expect_equal(importance.Tree[, -1, with=FALSE], importance.Tree.x[, -1, with=FALSE])
+  importance.x <- xgb.importance(model = bst.Tree)
+  expect_equal(importance[, -1, with=FALSE], importance.x[, -1, with=FALSE])
 
-  imp2plot <- xgb.plot.importance(importance_matrix = importance.Tree)
-  expect_equal(colnames(imp2plot), c("Feature", "Gain", "Cover", "Frequency", "Importance"))
-  xgb.ggplot.importance(importance_matrix = importance.Tree)
+  # plotting
+  imp2plot <- xgb.plot.importance(importance_matrix = importance.shap)
+  expect_equal(colnames(imp2plot), c("Feature", "Gain", "Cover", "Frequency", "SHAP", "Importance"))
+  xgb.ggplot.importance(importance_matrix = importance.shap)
 
   # for multiclass
-  imp.Tree <- xgb.importance(model = mbst.Tree)
-  expect_equal(dim(imp.Tree), c(4, 4))
-  xgb.importance(model = mbst.Tree, trees = seq(from=0, by=nclass, length.out=nrounds))
+  imp.multi <- xgb.importance(model = mbst.Tree)
+  expect_equal(dim(imp.multi), c(4, 4))
+  imp.multi.shap <- xgb.importance(model = mbst.Tree, data = as.matrix(iris[, -5]))
+  expect_equal(dim(imp.multi.shap), c(4, 5))
+  # for the specific class
+  trees.1 <- seq(from=1, by=nclass, length.out=nrounds)
+  imp.multi.1 <- xgb.importance(model = mbst.Tree, trees = trees.1)
+  expect_equal(dim(imp.multi.1), c(4, 4))
+  imp.multi.shap.1 <- xgb.importance(model = mbst.Tree, trees = trees.1,
+                                     data = as.matrix(iris[, -5]), target_class = 1)
+  expect_equal(dim(imp.multi.shap.1), c(4, 5))
 })
 
 test_that("xgb.importance works with GLM model", {

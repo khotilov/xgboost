@@ -6,7 +6,8 @@
 #' @param importance_matrix a \code{data.table} returned by \code{\link{xgb.importance}}.
 #' @param top_n maximal number of top features to include into the plot.
 #' @param measure the name of importance measure to plot. 
-#'        When \code{NULL}, 'Gain' would be used for trees and 'Weight' would be used for gblinear.
+#'        When \code{NULL}, either 'SHAP' (when available) or 'Gain' would be used for trees
+#'        and 'Weight' would be used for gblinear.
 #' @param rel_to_first whether importance values should be represented as relative to the highest ranked feature.
 #'        See Details.
 #' @param left_margin (base R barplot) allows to adjust the left margin size to fit feature names.
@@ -67,7 +68,9 @@ xgb.plot.importance <- function(importance_matrix = NULL, top_n = NULL, measure 
 
   imp_names <- colnames(importance_matrix)
   if (is.null(measure)) {
-    if (all(c("Feature", "Gain") %in% imp_names)) {
+    if (all(c("Feature", "SHAP") %in% imp_names)) {
+      measure <- "SHAP"
+    } else if (all(c("Feature", "Gain") %in% imp_names)) {
       measure <- "Gain"
     } else if (all(c("Feature", "Weight") %in% imp_names)) {
       measure <- "Weight"

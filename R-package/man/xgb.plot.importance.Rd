@@ -18,7 +18,8 @@ xgb.plot.importance(importance_matrix = NULL, top_n = NULL,
 \item{top_n}{maximal number of top features to include into the plot.}
 
 \item{measure}{the name of importance measure to plot. 
-When \code{NULL}, 'Gain' would be used for trees and 'Weight' would be used for gblinear.}
+When \code{NULL}, either 'SHAP' (when available) or 'Gain' would be used for trees
+and 'Weight' would be used for gblinear.}
 
 \item{rel_to_first}{whether importance values should be represented as relative to the highest ranked feature.
 See Details.}
