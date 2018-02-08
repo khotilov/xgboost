@@ -524,6 +524,117 @@ cb.cv.predict <- function(save_models = FALSE) {
 }
 
 
+#' Callback closure for collecting the history of a gblinear booster.
+#'
+#' @param sparse when set to FALSE/TURE, a dense/sparse matrix is used to store the result.
+#'
+#' @details
+#' To keep things fast and simple, gblinear booster does not internally store the history of linear
+#' model coefficients at each boosting iteration. This callback provides a workaround for storing 
+#' all the coefficients, by extracting them after each training iteration.
+#'
+#' Callback function expects the following values to be set in its calling frame:
+#' \code{bst} (or \code{bst_folds} and \code{basket}).
+#'
+#' @return
+#' The results are returned through the \code{coefs} element of a closure. In case of \code{xgb.train},
+#' it is either a dense of a sparse matrix. In case of \code{xgb.cv}, it is a list (an element per fold)
+#' of such matrices.
+#'
+#' @seealso
+#' \code{\link{callbacks}}
+#'
+#' @examples
+#' 
+#' # binary classification:
+#' bst <- xgboost(data = scale(as.matrix(iris[, -5])), label = 1*(iris$Species == "versicolor"),
+#'                booster = "gblinear", eta = 0.3, nthread = 1, nrounds = 100, lambda = 0.5,
+#'                objective = "reg:logistic", callbacks = list(cb.gblinear.collect()))
+#' # extract the coefficients' path
+#' coef_path <- environment(bst$callbacks$cb.gblinear.collect)$coefs
+#' # plot the coefficients' values vs boosting iteration number
+#' matplot(coef_path, type = 'l')
+#'
+#' # multiclass:
+#' bst <- xgboost(data = scale(as.matrix(iris[, -5])), label = as.numeric(iris$Species) - 1,
+#'                booster = "gblinear", eta = 0.3, nthread = 1, nrounds = 100, lambda = 0.5,
+#'                objective = "multi:softprob", num_class = 3,
+#'                callbacks = list(cb.gblinear.collect()))
+#' coef_path <- environment(bst$callbacks$cb.gblinear.collect)$coefs
+#' # separately for each class:
+#' coef_path[, seq(1,by=3,length.out=5)] %>% matplot(type = 'l')
+#' coef_path[, seq(2,by=3,length.out=5)] %>% matplot(type = 'l')
+#' coef_path[, seq(3,by=3,length.out=5)] %>% matplot(type = 'l')
+#'
+#' @export
+cb.gblinear.collect <- function(sparse=FALSE) {
+  coefs <- NULL
+
+  init <- function(env) {
+    if (!is.null(env$bst)) { # xgb.train:
+      coef_path <- list()
+    } else if (!is.null(env$bst_folds)) { # xgb.cv:
+      coef_path <- rep(list(), length(env$bst_folds))
+    } else stop("Parent frame has neither 'bst' nor 'bst_folds'")
+  }
+
+  # convert from list to (sparse) matrix
+  list2mat <- function(coef_list) {
+    if (sparse) {
+      coef_mat <- sparseMatrix(x = unlist(lapply(coef_list, slot, "x")),
+                               i = unlist(lapply(coef_list, slot, "i")),
+                               p = c(0, cumsum(sapply(coef_list, function(x) length(x@x)))),
+                               dims = c(length(coef_list[[1]]), length(coef_list)))
+      str(coef_mat)
+      return(t(coef_mat))
+    } else {
+      return(do.call(rbind, coef_list))
+    }
+  }
+
+  finalizer <- function(env) {
+    if (length(coefs) == 0)
+      return()
+    if (!is.null(env$bst)) { # xgb.train:
+      coefs <<- list2mat(coefs)
+    } else { # xgb.cv:
+      for (i in seq_along(env$bst_folds)) {
+        coefs[[f]] <<- list2mat(coefs[[i]])
+      }
+    }
+  }
+
+  extract.coef <- function(bst) {
+    cf <- as.numeric(grep('(booster|bias|weigh)', xgb.dump(bst), invert = TRUE, value = TRUE))
+    if (sparse)
+        cf <- as(cf, "sparseVector")
+    cf
+  }
+
+  callback <- function(env = parent.frame(), finalize = FALSE) {
+    if (is.null(coefs))
+      init(env)
+
+    if (finalize)
+      return(finalizer(env))
+
+    if (!is.null(env$bst)) { # xgb.train:
+      cf <- extract.coef(env$bst)
+      coefs <<- c(coefs, list(cf))
+    } else { # xgb.cv:
+      for (i in seq_along(env$bst_folds)) {
+        cf <- extract.coef(env$bst_folds[[i]]$bst)
+        coefs[[f]] <<- c(coefs, list(cf))
+      }
+    }
+  }
+
+  attr(callback, 'call') <- match.call()
+  attr(callback, 'name') <- 'cb.gblinear.collect'
+  callback
+}
+
+
 #
 # Internal utility functions for callbacks ------------------------------------
 # 
