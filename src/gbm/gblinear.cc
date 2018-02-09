@@ -42,9 +42,9 @@ struct GBLinearModelParam :public dmlc::Parameter<GBLinearModelParam> {
   }
   DMLC_DECLARE_PARAMETER(GBLinearModelParam) {
     DMLC_DECLARE_FIELD(num_feature).set_lower_bound(0)
-        .describe("Number of features used in classification.");
+        .describe("Number of features.");
     DMLC_DECLARE_FIELD(num_output_group).set_lower_bound(1).set_default(1)
-        .describe("Number of output groups in the setting.");
+        .describe("Number of output groups.");
   }
 };
 
@@ -64,6 +64,8 @@ struct GBLinearTrainParam : public dmlc::Parameter<GBLinearTrainParam> {
   int gblinear_method;
   /*! \brief number of top features to update per boosting round in stagewise algorithm */
   unsigned top_n;
+  /*! \brief flag to shuffle the order of features at each update */
+  bool shuffle_features;
   // flag to print out detailed breakdown of runtime
   int debug_verbose;
   // declare parameters
@@ -96,6 +98,10 @@ struct GBLinearTrainParam : public dmlc::Parameter<GBLinearTrainParam> {
         .describe("The number of top features to select and update per boosting round "
                   "when using stagewise algorithm. Zero means using all the features ordered "
                   "by decreasing magnitude of their univariate weight changes.");
+    DMLC_DECLARE_FIELD(shuffle_features)
+        .set_default(false)
+        .describe("Flag for whether to random-shuffle the order of features before each update. "
+                  "May help to reduce the hogwild algorithm bias towards earlier features.");
     DMLC_DECLARE_FIELD(debug_verbose)
         .set_lower_bound(0)
         .set_default(0)
@@ -136,8 +142,6 @@ class GBLinear : public GradientBooster {
       model.param.InitAllowUnknown(cfg);
     }
     param.InitAllowUnknown(cfg);
-    //std::cout<<"PPP:"<<std::endl;
-    //for(auto &a : param.__DICT__()) std::cout<<a.first<<":"<<a.second<<std::endl;
   }
 
   void Load(dmlc::Stream* fi) override {
@@ -154,13 +158,17 @@ class GBLinear : public GradientBooster {
     // lazily initialize the model when not ready.
     if (model.weight.size() == 0) {
       model.InitModel();
-
+    }
+    if (feat_index.size() == 0) {
+      const size_t nfeat = model.param.num_feature;
       if (param.gblinear_method == kStagewise) {
         // pre-allocate the memory
-        deltaw.reserve(model.param.num_feature * model.param.num_output_group);
-        sorted_idx.reserve(model.param.num_feature);
-        top_features.reserve(model.param.num_feature);
+        deltaw.reserve(nfeat * model.param.num_output_group);
+        sorted_idx.reserve(nfeat);
+        top_features.reserve(nfeat);
       }
+      feat_index.resize(nfeat);
+      std::iota(feat_index.begin(), feat_index.end(), 0);
     }
     double tstart = dmlc::GetTime();
     switch (param.gblinear_method) {
@@ -174,7 +182,7 @@ class GBLinear : public GradientBooster {
       }
     }
     if (param.debug_verbose > 0) {
-      LOG(INFO) << "DoBoost(): " << 1000 * (dmlc::GetTime() - tstart) << " msec";
+      LOG(CONSOLE) << "DoBoost(): " << 1000 * (dmlc::GetTime() - tstart) << " msec";
     }
   }
 
@@ -185,7 +193,7 @@ class GBLinear : public GradientBooster {
       model.InitModel();
     }
     CHECK_EQ(ntree_limit, 0U)
-        << "GBLinear::Predict ntrees>0 is not valid for the gblinear booster";
+        << "GBLinear::Predict ntree_limit!=0 is not valid for gblinear";
     std::vector<bst_float> &preds = *out_preds;
     const std::vector<bst_float>& base_margin = p_fmat->info().base_margin;
     preds.resize(0);
@@ -232,7 +240,8 @@ class GBLinear : public GradientBooster {
 
   void PredictContribution(DMatrix* p_fmat,
                            std::vector<bst_float>* out_contribs,
-                           unsigned ntree_limit) override {
+                           unsigned ntree_limit, bool approximate, int condition = 0,
+                           unsigned condition_feature = 0) override {
     if (model.weight.size() == 0) {
       model.InitModel();
     }
@@ -271,6 +280,12 @@ class GBLinear : public GradientBooster {
         }
       }
     }
+  }
+
+  void PredictInteractionContributions(DMatrix* p_fmat,
+                           std::vector<bst_float>* out_contribs,
+                           unsigned ntree_limit, bool approximate) override {
+    LOG(FATAL) << "gblinear does not provide interaction contributions";
   }
 
   std::vector<std::string> DumpModel(const FeatureMap& fmap,
@@ -326,8 +341,8 @@ class GBLinear : public GradientBooster {
       #pragma omp parallel for schedule(static) reduction(+: sum_grad, sum_hess)
       for (bst_omp_uint i = 0; i < ndata; ++i) {
         bst_gpair &p = gpair[rowset[i] * ngroup + gid];
-        if (p.hess >= 0.0f) {
-          sum_grad += p.grad; sum_hess += p.hess;
+        if (p.GetHess() >= 0.0f) {
+          sum_grad += p.GetGrad(); sum_hess += p.GetHess();
         }
       }
       if (param.scaled_loss && ndata > 0) {
@@ -341,8 +356,8 @@ class GBLinear : public GradientBooster {
       #pragma omp parallel for schedule(static)
       for (bst_omp_uint i = 0; i < ndata; ++i) {
         bst_gpair &p = gpair[rowset[i] * ngroup + gid];
-        if (p.hess >= 0.0f) {
-          p.grad += p.hess * dw;
+        if (p.GetHess() >= 0.0f) {
+          p += bst_gpair(p.GetHess() * dw, 0);
         }
       }
     }
@@ -353,6 +368,9 @@ class GBLinear : public GradientBooster {
     this->UpdateBias(p_fmat, in_gpair);
     std::vector<bst_gpair> &gpair = *in_gpair;
     const int ngroup = model.param.num_output_group;
+    if (param.shuffle_features) {
+      std::shuffle(feat_index.begin(), feat_index.end(), common::GlobalRandom());
+    }
     dmlc::DataIter<ColBatch> *iter = p_fmat->ColIterator();
     while (iter->Next()) {
       const ColBatch &batch = iter->Value();
@@ -361,17 +379,18 @@ class GBLinear : public GradientBooster {
       // lock-free parallel updates of all features
       #pragma omp parallel for schedule(static)
       for (bst_omp_uint i = 0; i < nfeat; ++i) {
-        const bst_uint fid = batch.col_index[i];
-        ColBatch::Inst col = batch[i];
+        auto ii = feat_index[i];
+        const bst_uint fid = batch.col_index[ii];
+        ColBatch::Inst col = batch[ii];
         for (int gid = 0; gid < ngroup; ++gid) {
           const bst_uint ndata = col.length;
           double sum_grad = 0.0, sum_hess = 0.0;
           for (bst_uint j = 0; j < ndata; ++j) {
             const bst_float v = col[j].fvalue;
             bst_gpair &p = gpair[col[j].index * ngroup + gid];
-            if (p.hess < 0.0f) continue;
-            sum_grad += p.grad * v;
-            sum_hess += p.hess * v * v;
+            if (p.GetHess() < 0.0f) continue;
+            sum_grad += p.GetGrad() * v;
+            sum_hess += p.GetHess() * v * v;
           }
           if (param.scaled_loss && ndata > 0) {
             sum_grad /= ndata; sum_hess /= ndata;
@@ -383,8 +402,8 @@ class GBLinear : public GradientBooster {
           // update grad values
           for (bst_uint j = 0; j < col.length; ++j) {
             bst_gpair &p = gpair[col[j].index * ngroup + gid];
-            if (p.hess < 0.0f) continue;
-            p.grad += p.hess * col[j].fvalue * dw;
+            if (p.GetHess() < 0.0f) continue;
+            p += bst_gpair(p.GetHess() * col[j].fvalue * dw, 0);
           }
         }
       }
@@ -415,9 +434,9 @@ class GBLinear : public GradientBooster {
           for (bst_uint j = 0; j < ndata; ++j) {
             const bst_float v = col[j].fvalue;
             bst_gpair &p = gpair[col[j].index * ngroup + gid];
-            if (p.hess < 0.0f) continue;
-            sum_grad += p.grad * v;
-            sum_hess += p.hess * v * v;
+            if (p.GetHess() < 0.0f) continue;
+            sum_grad += p.GetGrad() * v;
+            sum_hess += p.GetHess() * v * v;
           }
           if (param.scaled_loss && ndata > 0) {
             sum_grad /= ndata; sum_hess /= ndata;
@@ -468,9 +487,9 @@ class GBLinear : public GradientBooster {
             for (bst_omp_uint j = 0; j < ndata; ++j) {
               const bst_float v = col[j].fvalue;
               bst_gpair &p = gpair[col[j].index * ngroup + gid];
-              if (p.hess < 0.0f) continue;
-              sum_grad += p.grad * v;
-              sum_hess += p.hess * v * v;
+              if (p.GetHess() < 0.0f) continue;
+              sum_grad += p.GetGrad() * v;
+              sum_hess += p.GetHess() * v * v;
             }
             if (param.scaled_loss && ndata > 0) {
               sum_grad /= ndata; sum_hess /= ndata;
@@ -483,8 +502,8 @@ class GBLinear : public GradientBooster {
           #pragma omp parallel for schedule(static)
           for (bst_omp_uint j = 0; j < ndata; ++j) {
             bst_gpair &p = gpair[col[j].index * ngroup + gid];
-            if (p.hess < 0.0f) continue;
-            p.grad += p.hess * col[j].fvalue * dw;
+            if (p.GetHess() < 0.0f) continue;
+            p += bst_gpair(p.GetHess() * col[j].fvalue * dw, 0);
           }
         }
       }
@@ -544,6 +563,8 @@ class GBLinear : public GradientBooster {
   Model model;
   // training parameter
   GBLinearTrainParam param;
+  // Per feature: shuffle index of each feature index
+  std::vector<bst_uint> feat_index;
 
   // The following three are used by the stagewise algorithm.
   // Having them as class members helps to avoid repeated construction & memory allocs.
