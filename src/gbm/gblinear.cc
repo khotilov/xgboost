@@ -16,6 +16,7 @@
 #include <cstring>
 #include <algorithm>
 #include <numeric>
+#include "../common/random.h"
 
 namespace xgboost {
 namespace gbm {
