@@ -5,6 +5,7 @@
 #include <xgboost/tree_model.h>
 #include <xgboost/tree_updater.h>
 #include "dmlc/logging.h"
+#include "../common/host_device_vector.h"
 
 namespace xgboost {
 namespace predictor {
@@ -108,6 +109,12 @@ class CPUPredictor : public Predictor {
   }
 
  public:
+  void PredictBatch(DMatrix* dmat, HostDeviceVector<bst_float>* out_preds,
+                    const gbm::GBTreeModel& model, int tree_begin,
+                    unsigned ntree_limit = 0) override {
+    PredictBatch(dmat, &out_preds->data_h(), model, tree_begin, ntree_limit);
+  }
+
   void PredictBatch(DMatrix* dmat, std::vector<bst_float>* out_preds,
                     const gbm::GBTreeModel& model, int tree_begin,
                     unsigned ntree_limit = 0) override {
@@ -206,9 +213,11 @@ class CPUPredictor : public Predictor {
     }
   }
 
-  void PredictContribution(DMatrix* p_fmat,
-                           std::vector<bst_float>* out_contribs,
-                           const gbm::GBTreeModel& model, unsigned ntree_limit) override {
+  void PredictContribution(DMatrix* p_fmat, std::vector<bst_float>* out_contribs,
+                           const gbm::GBTreeModel& model, unsigned ntree_limit,
+                           bool approximate,
+                           int condition,
+                           unsigned condition_feature) override {
     const int nthread = omp_get_max_threads();
     InitThreadTemp(nthread,  model.param.num_feature);
     const MetaInfo& info = p_fmat->info();
@@ -225,8 +234,8 @@ class CPUPredictor : public Predictor {
     // make sure contributions is zeroed, we could be reusing a previously
     // allocated one
     std::fill(contribs.begin(), contribs.end(), 0);
-// initialize tree node mean values
-#pragma omp parallel for schedule(static)
+    // initialize tree node mean values
+    #pragma omp parallel for schedule(static)
     for (bst_omp_uint i = 0; i < ntree_limit; ++i) {
       model.trees[i]->FillNodeMeanValues();
     }
@@ -253,7 +262,12 @@ class CPUPredictor : public Predictor {
             if (model.tree_info[j] != gid) {
               continue;
             }
-            model.trees[j]->CalculateContributions(feats, root_id, p_contribs);
+            if (!approximate) {
+              model.trees[j]->CalculateContributions(feats, root_id, p_contribs,
+                                                     condition, condition_feature);
+            } else {
+              model.trees[j]->CalculateContributionsApprox(feats, root_id, p_contribs);
+            }
           }
           feats.Drop(batch[i]);
           // add base margin to BIAS
@@ -261,6 +275,50 @@ class CPUPredictor : public Predictor {
             p_contribs[ncolumns - 1] += base_margin[row_idx * ngroup + gid];
           } else {
             p_contribs[ncolumns - 1] += model.base_margin;
+          }
+        }
+      }
+    }
+  }
+
+  void PredictInteractionContributions(DMatrix* p_fmat, std::vector<bst_float>* out_contribs,
+                                       const gbm::GBTreeModel& model, unsigned ntree_limit,
+                                       bool approximate) override {
+    const MetaInfo& info = p_fmat->info();
+    const int ngroup = model.param.num_output_group;
+    size_t ncolumns = model.param.num_feature;
+    const unsigned row_chunk = ngroup * (ncolumns + 1) * (ncolumns + 1);
+    const unsigned mrow_chunk = (ncolumns + 1) * (ncolumns + 1);
+    const unsigned crow_chunk = ngroup * (ncolumns + 1);
+
+    // allocate space for (number of features^2) times the number of rows and tmp off/on contribs
+    std::vector<bst_float>& contribs = *out_contribs;
+    contribs.resize(info.num_row * ngroup * (ncolumns + 1) * (ncolumns + 1));
+    std::vector<bst_float> contribs_off(info.num_row * ngroup * (ncolumns + 1));
+    std::vector<bst_float> contribs_on(info.num_row * ngroup * (ncolumns + 1));
+    std::vector<bst_float> contribs_diag(info.num_row * ngroup * (ncolumns + 1));
+
+    // Compute the difference in effects when conditioning on each of the features on and off
+    // see: Axiomatic characterizations of probabilistic and
+    //      cardinal-probabilistic interaction indices
+    PredictContribution(p_fmat, &contribs_diag, model, ntree_limit, approximate, 0, 0);
+    for (size_t i = 0; i < ncolumns + 1; ++i) {
+      PredictContribution(p_fmat, &contribs_off, model, ntree_limit, approximate, -1, i);
+      PredictContribution(p_fmat, &contribs_on, model, ntree_limit, approximate, 1, i);
+
+      for (size_t j = 0; j < info.num_row; ++j) {
+        for (int l = 0; l < ngroup; ++l) {
+          const unsigned o_offset = j * row_chunk + l * mrow_chunk + i * (ncolumns + 1);
+          const unsigned c_offset = j * crow_chunk + l * (ncolumns + 1);
+          contribs[o_offset + i] = 0;
+          for (size_t k = 0; k < ncolumns + 1; ++k) {
+            // fill in the diagonal with additive effects, and off-diagonal with the interactions
+            if (k == i) {
+              contribs[o_offset + i] += contribs_diag[c_offset + k];
+            } else {
+              contribs[o_offset + k] = (contribs_on[c_offset + k] - contribs_off[c_offset + k])/2.0;
+              contribs[o_offset + i] -= contribs[o_offset + k];
+            }
           }
         }
       }

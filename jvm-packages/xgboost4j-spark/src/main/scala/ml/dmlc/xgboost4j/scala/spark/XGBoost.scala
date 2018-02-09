@@ -16,42 +16,47 @@
 
 package ml.dmlc.xgboost4j.scala.spark
 
-import scala.collection.mutable
+import java.io.File
+import java.nio.file.Files
 
+import scala.collection.mutable
+import scala.util.Random
 import ml.dmlc.xgboost4j.java.{IRabitTracker, Rabit, XGBoostError, RabitTracker => PyRabitTracker}
 import ml.dmlc.xgboost4j.scala.rabit.RabitTracker
 import ml.dmlc.xgboost4j.scala.{XGBoost => SXGBoost, _}
 import ml.dmlc.xgboost4j.{LabeledPoint => XGBLabeledPoint}
-
+import org.apache.commons.io.FileUtils
 import org.apache.commons.logging.LogFactory
 import org.apache.hadoop.fs.{FSDataInputStream, Path}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.Dataset
 import org.apache.spark.ml.feature.{LabeledPoint => MLLabeledPoint}
-import org.apache.spark.{SparkContext, TaskContext}
+import org.apache.spark.{SparkContext, SparkParallelismTracker, TaskContext}
+
+
+/**
+ * Rabit tracker configurations.
+ *
+ * @param workerConnectionTimeout The timeout for all workers to connect to the tracker.
+ *                                Set timeout length to zero to disable timeout.
+ *                                Use a finite, non-zero timeout value to prevent tracker from
+ *                                hanging indefinitely (in milliseconds)
+ *                                (supported by "scala" implementation only.)
+ * @param trackerImpl Choice between "python" or "scala". The former utilizes the Java wrapper of
+ *                    the Python Rabit tracker (in dmlc_core), whereas the latter is implemented
+ *                    in Scala without Python components, and with full support of timeouts.
+ *                    The Scala implementation is currently experimental, use at your own risk.
+ */
+case class TrackerConf(workerConnectionTimeout: Long, trackerImpl: String)
 
 object TrackerConf {
   def apply(): TrackerConf = TrackerConf(0L, "python")
 }
 
-/**
-  * Rabit tracker configurations.
-  * @param workerConnectionTimeout The timeout for all workers to connect to the tracker.
-  *                                Set timeout length to zero to disable timeout.
-  *                                Use a finite, non-zero timeout value to prevent tracker from
-  *                                hanging indefinitely (in milliseconds)
- *                                (supported by "scala" implementation only.)
-  * @param trackerImpl Choice between "python" or "scala". The former utilizes the Java wrapper of
-  *                    the Python Rabit tracker (in dmlc_core), whereas the latter is implemented
-  *                    in Scala without Python components, and with full support of timeouts.
-  *                    The Scala implementation is currently experimental, use at your own risk.
-  */
-case class TrackerConf(workerConnectionTimeout: Long, trackerImpl: String)
-
 object XGBoost extends Serializable {
   private val logger = LogFactory.getLog("XGBoostSpark")
 
-  private def fromDenseToSparseLabeledPoints(
+  private def removeMissingValues(
       denseLabeledPoints: Iterator[XGBLabeledPoint],
       missing: Float): Iterator[XGBLabeledPoint] = {
     if (!missing.isNaN) {
@@ -89,76 +94,73 @@ object XGBoost extends Serializable {
     } else {
       throw new IllegalArgumentException(
         s"Encountered a partition with $nUndefined NaN base margin values. " +
-            "If you want to specify base margin, ensure all values are non-NaN.")
+          s"If you want to specify base margin, ensure all values are non-NaN.")
     }
   }
 
   private[spark] def buildDistributedBoosters(
-      trainingSet: RDD[XGBLabeledPoint],
+      data: RDD[XGBLabeledPoint],
       params: Map[String, Any],
       rabitEnv: java.util.Map[String, String],
-      numWorkers: Int,
       round: Int,
       obj: ObjectiveTrait,
       eval: EvalTrait,
       useExternalMemory: Boolean,
-      missing: Float): RDD[Booster] = {
-    val partitionedTrainingSet = if (trainingSet.getNumPartitions != numWorkers) {
-      logger.info(s"repartitioning training set to $numWorkers partitions")
-      trainingSet.repartition(numWorkers)
-    } else {
-      trainingSet
-    }
-    val partitionedBaseMargin = partitionedTrainingSet.map(_.baseMargin)
-    val appName = partitionedTrainingSet.context.appName
+      missing: Float,
+      prevBooster: Booster
+    ): RDD[(Booster, Map[String, Array[Float]])] = {
+
+    val partitionedBaseMargin = data.map(_.baseMargin)
     // to workaround the empty partitions in training dataset,
     // this might not be the best efficient implementation, see
     // (https://github.com/dmlc/xgboost/issues/1277)
-    partitionedTrainingSet.zipPartitions(partitionedBaseMargin) { (trainingPoints, baseMargins) =>
-      if (trainingPoints.isEmpty) {
+    data.zipPartitions(partitionedBaseMargin) { (labeledPoints, baseMargins) =>
+      if (labeledPoints.isEmpty) {
         throw new XGBoostError(
           s"detected an empty partition in the training data, partition ID:" +
-              s" ${TaskContext.getPartitionId()}")
+            s" ${TaskContext.getPartitionId()}")
       }
-      val cacheFileName = if (useExternalMemory) {
-        s"$appName-${TaskContext.get().stageId()}-" +
-            s"dtrain_cache-${TaskContext.getPartitionId()}"
+      val taskId = TaskContext.getPartitionId().toString
+      val cacheDirName = if (useExternalMemory) {
+        val dir = Files.createTempDirectory(s"${TaskContext.get().stageId()}-cache-$taskId")
+        Some(dir.toAbsolutePath.toString)
       } else {
-        null
+        None
       }
-      rabitEnv.put("DMLC_TASK_ID", TaskContext.getPartitionId().toString)
+      rabitEnv.put("DMLC_TASK_ID", taskId)
       Rabit.init(rabitEnv)
-      val trainingMatrix = new DMatrix(
-        fromDenseToSparseLabeledPoints(trainingPoints, missing), cacheFileName)
+      val watches = Watches(params,
+        removeMissingValues(labeledPoints, missing),
+        fromBaseMarginsToArray(baseMargins), cacheDirName)
+
       try {
-        // TODO: use group attribute from the points.
-        if (params.contains("groupData") && params("groupData") != null) {
-          trainingMatrix.setGroup(params("groupData").asInstanceOf[Seq[Seq[Int]]](
-            TaskContext.getPartitionId()).toArray)
-        }
-        fromBaseMarginsToArray(baseMargins).foreach(trainingMatrix.setBaseMargin)
-        val booster = SXGBoost.train(trainingMatrix, params, round,
-          watches = Map("train" -> trainingMatrix), obj, eval)
-        Iterator(booster)
+        val numEarlyStoppingRounds = params.get("numEarlyStoppingRounds")
+            .map(_.toString.toInt).getOrElse(0)
+        val metrics = Array.tabulate(watches.size)(_ => Array.ofDim[Float](round))
+        val booster = SXGBoost.train(watches.train, params, round,
+          watches.toMap, metrics, obj, eval,
+          earlyStoppingRound = numEarlyStoppingRounds, prevBooster)
+        Iterator(booster -> watches.toMap.keys.zip(metrics).toMap)
       } finally {
         Rabit.shutdown()
-        trainingMatrix.delete()
+        watches.delete()
       }
     }.cache()
   }
 
   /**
-   * train XGBoost model with the DataFrame-represented data
-   * @param trainingData the trainingset represented as DataFrame
+   * Train XGBoost model with the DataFrame-represented data
+   *
+   * @param trainingData the training set represented as DataFrame
    * @param params Map containing the parameters to configure XGBoost
    * @param round the number of iterations
    * @param nWorkers the number of xgboost workers, 0 by default which means that the number of
    *                 workers equals to the partition number of trainingData RDD
-   * @param obj the user-defined objective function, null by default
-   * @param eval the user-defined evaluation function, null by default
+   * @param obj An instance of [[ObjectiveTrait]] specifying a custom objective, null by default
+   * @param eval An instance of [[EvalTrait]] specifying a custom evaluation metric, null by default
    * @param useExternalMemory indicate whether to use external memory cache, by setting this flag as
    *                           true, the user may save the RAM cost for running XGBoost within Spark
-   * @param missing the value represented the missing value in the dataset
+   * @param missing The value which represents a missing value in the dataset
    * @param featureCol the name of input column, "features" as default value
    * @param labelCol the name of output column, "label" as default value
    * @throws ml.dmlc.xgboost4j.java.XGBoostError when the model training is failed
@@ -195,20 +197,21 @@ object XGBoost extends Serializable {
     val objective = params.getOrElse("objective", params.getOrElse("obj_type", null))
     objective != null && {
       val objStr = objective.toString
-      objStr == "classification" || (!objStr.startsWith("reg:") && objStr != "count:poisson" &&
-        objStr != "rank:pairwise")
+      objStr != "regression" && !objStr.startsWith("reg:") && objStr != "count:poisson" &&
+        !objStr.startsWith("rank:")
     }
   }
 
   /**
-   * train XGBoost model with the RDD-represented data
-   * @param trainingData the trainingset represented as RDD
+   * Train XGBoost model with the RDD-represented data
+   *
+   * @param trainingData the training set represented as RDD
    * @param params Map containing the configuration entries
    * @param round the number of iterations
    * @param nWorkers the number of xgboost workers, 0 by default which means that the number of
    *                 workers equals to the partition number of trainingData RDD
-   * @param obj the user-defined objective function, null by default
-   * @param eval the user-defined evaluation function, null by default
+   * @param obj An instance of [[ObjectiveTrait]] specifying a custom objective, null by default
+   * @param eval An instance of [[EvalTrait]] specifying a custom evaluation metric, null by default
    * @param useExternalMemory indicate whether to use external memory cache, by setting this flag as
    *                           true, the user may save the RAM cost for running XGBoost within Spark
    * @param missing the value represented the missing value in the dataset
@@ -225,8 +228,7 @@ object XGBoost extends Serializable {
       eval: EvalTrait = null,
       useExternalMemory: Boolean = false,
       missing: Float = Float.NaN): XGBoostModel = {
-    trainWithRDD(trainingData, params, round, nWorkers, obj, eval, useExternalMemory,
-      missing)
+    trainWithRDD(trainingData, params, round, nWorkers, obj, eval, useExternalMemory, missing)
   }
 
   private def overrideParamsAccordingToTaskCPUs(
@@ -257,18 +259,19 @@ object XGBoost extends Serializable {
   }
 
   /**
-   * various of train()
-   * @param trainingData the trainingset represented as RDD
+   * Train XGBoost model with the RDD-represented data
+   *
+   * @param trainingData the training set represented as RDD
    * @param params Map containing the configuration entries
    * @param round the number of iterations
    * @param nWorkers the number of xgboost workers, 0 by default which means that the number of
    *                 workers equals to the partition number of trainingData RDD
-   * @param obj the user-defined objective function, null by default
-   * @param eval the user-defined evaluation function, null by default
+   * @param obj An instance of [[ObjectiveTrait]] specifying a custom objective, null by default
+   * @param eval An instance of [[EvalTrait]] specifying a custom evaluation metric, null by default
    * @param useExternalMemory indicate whether to use external memory cache, by setting this flag as
    *                          true, the user may save the RAM cost for running XGBoost within Spark
-   * @param missing the value represented the missing value in the dataset
-   * @throws ml.dmlc.xgboost4j.java.XGBoostError when the model training is failed
+   * @param missing The value which represents a missing value in the dataset
+   * @throws ml.dmlc.xgboost4j.java.XGBoostError when the model training has failed
    * @return XGBoostModel when successful training
    */
   @throws(classOf[XGBoostError])
@@ -301,58 +304,103 @@ object XGBoost extends Serializable {
       missing: Float = Float.NaN): XGBoostModel = {
     if (params.contains("tree_method")) {
       require(params("tree_method") != "hist", "xgboost4j-spark does not support fast histogram" +
-          " for now")
+        " for now")
     }
     require(nWorkers > 0, "you must specify more than 0 workers")
     if (obj != null) {
       require(params.get("obj_type").isDefined, "parameter \"obj_type\" is not defined," +
-          " you have to specify the objective type as classification or regression with a" +
-          " customized objective function")
+        " you have to specify the objective type as classification or regression with a" +
+        " customized objective function")
     }
     val trackerConf = params.get("tracker_conf") match {
       case None => TrackerConf()
       case Some(conf: TrackerConf) => conf
       case _ => throw new IllegalArgumentException("parameter \"tracker_conf\" must be an " +
-          "instance of TrackerConf.")
+        "instance of TrackerConf.")
     }
-    val tracker = startTracker(nWorkers, trackerConf)
-    try {
-      val overriddenParams = overrideParamsAccordingToTaskCPUs(params, trainingData.sparkContext)
-      val boosters = buildDistributedBoosters(trainingData, overriddenParams,
-        tracker.getWorkerEnvs, nWorkers, round, obj, eval, useExternalMemory, missing)
-      val sparkJobThread = new Thread() {
-        override def run() {
-          // force the job
-          boosters.foreachPartition(() => _)
-        }
+    val timeoutRequestWorkers: Long = params.get("timeout_request_workers") match {
+      case None => 0L
+      case Some(interval: Long) => interval
+      case _ => throw new IllegalArgumentException("parameter \"timeout_request_workers\" must be" +
+        " an instance of Long.")
+    }
+    val (checkpointPath, checkpointInterval) = CheckpointManager.extractParams(params)
+    val partitionedData = repartitionForTraining(trainingData, nWorkers)
+
+    val sc = trainingData.sparkContext
+    val checkpointManager = new CheckpointManager(sc, checkpointPath)
+    checkpointManager.cleanUpHigherVersions(round)
+
+    var prevBooster = checkpointManager.loadCheckpointAsBooster
+    // Train for every ${savingRound} rounds and save the partially completed booster
+    checkpointManager.getCheckpointRounds(checkpointInterval, round).map {
+      checkpointRound: Int =>
+        val tracker = startTracker(nWorkers, trackerConf)
+        try {
+          val parallelismTracker = new SparkParallelismTracker(sc, timeoutRequestWorkers, nWorkers)
+          val overriddenParams = overrideParamsAccordingToTaskCPUs(params, sc)
+          val boostersAndMetrics = buildDistributedBoosters(partitionedData, overriddenParams,
+            tracker.getWorkerEnvs, checkpointRound, obj, eval, useExternalMemory, missing,
+            prevBooster)
+          val sparkJobThread = new Thread() {
+            override def run() {
+              // force the job
+              boostersAndMetrics.foreachPartition(() => _)
+            }
+          }
+          sparkJobThread.setUncaughtExceptionHandler(tracker)
+          sparkJobThread.start()
+          val isClsTask = isClassificationTask(params)
+          val trackerReturnVal = parallelismTracker.execute(tracker.waitFor(0L))
+          logger.info(s"Rabit returns with exit code $trackerReturnVal")
+          val model = postTrackerReturnProcessing(trackerReturnVal, boostersAndMetrics,
+            sparkJobThread, isClsTask)
+          if (isClsTask){
+            model.asInstanceOf[XGBoostClassificationModel].numOfClasses =
+              params.getOrElse("num_class", "2").toString.toInt
+          }
+          if (checkpointRound < round) {
+            prevBooster = model.booster
+            checkpointManager.updateCheckpoint(model)
+          }
+          model
+      } finally {
+        tracker.stop()
       }
-      sparkJobThread.setUncaughtExceptionHandler(tracker)
-      sparkJobThread.start()
-      val isClsTask = isClassificationTask(params)
-      val trackerReturnVal = tracker.waitFor(0L)
-      logger.info(s"Rabit returns with exit code $trackerReturnVal")
-      postTrackerReturnProcessing(trackerReturnVal, boosters, overriddenParams, sparkJobThread,
-        isClsTask)
-    } finally {
-      tracker.stop()
+    }.last
+  }
+
+
+  private[spark] def repartitionForTraining(trainingData: RDD[XGBLabeledPoint], nWorkers: Int) = {
+    if (trainingData.getNumPartitions != nWorkers) {
+      logger.info(s"repartitioning training set to $nWorkers partitions")
+      trainingData.repartition(nWorkers)
+    } else {
+      trainingData
     }
   }
 
   private def postTrackerReturnProcessing(
-      trackerReturnVal: Int, distributedBoosters: RDD[Booster],
-      params: Map[String, Any], sparkJobThread: Thread, isClassificationTask: Boolean):
-    XGBoostModel = {
+      trackerReturnVal: Int,
+      distributedBoostersAndMetrics: RDD[(Booster, Map[String, Array[Float]])],
+      sparkJobThread: Thread,
+      isClassificationTask: Boolean
+  ): XGBoostModel = {
     if (trackerReturnVal == 0) {
-      val xgboostModel = XGBoostModel(distributedBoosters.first(), isClassificationTask)
-      distributedBoosters.unpersist(false)
-      xgboostModel
+      // Copies of the final booster and the corresponding metrics
+      // reside in each partition of the `distributedBoostersAndMetrics`.
+      // Any of them can be used to create the model.
+      val (booster, metrics) = distributedBoostersAndMetrics.first()
+      val xgboostModel = XGBoostModel(booster, isClassificationTask)
+      distributedBoostersAndMetrics.unpersist(false)
+      xgboostModel.setSummary(XGBoostTrainingSummary(metrics))
     } else {
       try {
         if (sparkJobThread.isAlive) {
           sparkJobThread.interrupt()
         }
       } catch {
-        case ie: InterruptedException =>
+        case _: InterruptedException =>
           logger.info("spark job thread is interrupted")
       }
       throw new XGBoostError("XGBoostModel training failed")
@@ -367,12 +415,15 @@ object XGBoost extends Serializable {
   }
 
   private def setGeneralModelParams(
-      featureCol: String, labelCol: String, predCol: String, xgBoostModel: XGBoostModel):
-      XGBoostModel = {
+      featureCol: String,
+      labelCol: String,
+      predCol: String,
+      xgBoostModel: XGBoostModel): XGBoostModel = {
     xgBoostModel.setFeaturesCol(featureCol)
     xgBoostModel.setLabelCol(labelCol)
     xgBoostModel.setPredictionCol(predCol)
   }
+
 
   /**
    * Load XGBoost model from path in HDFS-compatible file system
@@ -389,6 +440,7 @@ object XGBoost extends Serializable {
     modelType match {
       case "_cls_" =>
         val rawPredictionCol = dataInStream.readUTF()
+        val numClasses = dataInStream.readInt()
         val thresholdLength = dataInStream.readInt()
         var thresholds: Array[Double] = null
         if (thresholdLength != -1) {
@@ -403,10 +455,71 @@ object XGBoost extends Serializable {
         if (thresholdLength != -1) {
           xgBoostModel.setThresholds(thresholds)
         }
+        xgBoostModel.asInstanceOf[XGBoostClassificationModel].numOfClasses = numClasses
         xgBoostModel
       case "_reg_" =>
         val xgBoostModel = new XGBoostRegressionModel(SXGBoost.loadModel(dataInStream))
         setGeneralModelParams(featureCol, labelCol, predictionCol, xgBoostModel)
+      case other =>
+        throw new XGBoostError(s"Unknown model type $other. Supported types " +
+          s"are: ['_reg_', '_cls_'].")
     }
+  }
+}
+
+private class Watches private(
+  val train: DMatrix,
+  val test: DMatrix,
+  private val cacheDirName: Option[String]) {
+
+  def toMap: Map[String, DMatrix] = Map("train" -> train, "test" -> test)
+    .filter { case (_, matrix) => matrix.rowNum > 0 }
+
+  def size: Int = toMap.size
+
+  def delete(): Unit = {
+    toMap.values.foreach(_.delete())
+    cacheDirName.foreach { name =>
+      FileUtils.deleteDirectory(new File(name))
+    }
+  }
+
+  override def toString: String = toMap.toString
+}
+
+private object Watches {
+
+  def apply(
+      params: Map[String, Any],
+      labeledPoints: Iterator[XGBLabeledPoint],
+      baseMarginsOpt: Option[Array[Float]],
+      cacheDirName: Option[String]): Watches = {
+    val trainTestRatio = params.get("trainTestRatio").map(_.toString.toDouble).getOrElse(1.0)
+    val seed = params.get("seed").map(_.toString.toLong).getOrElse(System.nanoTime())
+    val r = new Random(seed)
+    val testPoints = mutable.ArrayBuffer.empty[XGBLabeledPoint]
+    val trainPoints = labeledPoints.filter { labeledPoint =>
+      val accepted = r.nextDouble() <= trainTestRatio
+      if (!accepted) {
+        testPoints += labeledPoint
+      }
+
+      accepted
+    }
+    val trainMatrix = new DMatrix(trainPoints, cacheDirName.map(_ + "/train").orNull)
+    val testMatrix = new DMatrix(testPoints.iterator, cacheDirName.map(_ + "/test").orNull)
+    r.setSeed(seed)
+    for (baseMargins <- baseMarginsOpt) {
+      val (trainMargin, testMargin) = baseMargins.partition(_ => r.nextDouble() <= trainTestRatio)
+      trainMatrix.setBaseMargin(trainMargin)
+      testMatrix.setBaseMargin(testMargin)
+    }
+
+    // TODO: use group attribute from the points.
+    if (params.contains("groupData") && params("groupData") != null) {
+      trainMatrix.setGroup(params("groupData").asInstanceOf[Seq[Seq[Int]]](
+        TaskContext.getPartitionId()).toArray)
+    }
+    new Watches(trainMatrix, testMatrix, cacheDirName)
   }
 }
