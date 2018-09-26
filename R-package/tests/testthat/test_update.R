@@ -29,6 +29,9 @@ test_that("updating the model works", {
   tr1r <- xgb.model.dt.tree(model = bst1r)
   # all should be the same when no subsampling
   expect_equal(bst1$evaluation_log, bst1r$evaluation_log)
+  print("line 32")
+  print(tr1)
+  print(tr1r)
   expect_equal(tr1, tr1r, tolerance = 0.00001, check.attributes = FALSE)
 
   # the same boosting with subsampling with an extra 'refresh' updater:
@@ -38,6 +41,11 @@ test_that("updating the model works", {
   tr2r <- xgb.model.dt.tree(model = bst2r)
   # should be the same evaluation but different gains and larger cover
   expect_equal(bst2$evaluation_log, bst2r$evaluation_log)
+  print("line 41")
+  print(tr2)
+  print(tr2r)
+  print(tr2[Feature == 'Leaf']$Quality)
+  print(tr2r[Feature == 'Leaf']$Quality)
   expect_equal(tr2[Feature == 'Leaf']$Quality, tr2r[Feature == 'Leaf']$Quality)
   expect_gt(sum(abs(tr2[Feature != 'Leaf']$Quality - tr2r[Feature != 'Leaf']$Quality)), 100)
   expect_gt(sum(tr2r$Cover) / sum(tr2$Cover), 1.5)
@@ -61,6 +69,9 @@ test_that("updating the model works", {
   expect_gt(sum(tr2u$Cover) / sum(tr2$Cover), 1.5)
   # the results should be the same as for the model with an extra 'refresh' updater
   expect_equal(bst2r$evaluation_log, bst2u$evaluation_log)
+  print("line 64 ")
+  print(tr2)
+  print(tr2u)
   expect_equal(tr2r, tr2u, tolerance = 0.00001, check.attributes = FALSE)
   
   # process type 'update' for no-subsampling model, refreshing only the tree stats from TEST data:
